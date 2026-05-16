@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import difflib
 import json
 import os
 import re
@@ -29,6 +30,10 @@ Goal: extract recurring patterns that can become useful insight for Zayn's
 engineering workflow and agent tooling. Focus on concrete repeated behavior,
 friction, overload, missed automation, verification habits, and memory/journal
 quality. Do not summarize every command.
+
+The chunk may be selected by a script-level planner. Use planner metadata
+(`planner_strategy`, source size, total entries, selected indices, noise ratio)
+when judging coverage and when spotting overload/noise patterns.
 
 Safety:
 - Do not reveal secrets, tokens, API keys, credentials, or private hostnames.
@@ -87,10 +92,30 @@ Output JSON only:
 
 SECRET_PATTERNS = [
     (re.compile(r"sk-[A-Za-z0-9_-]{12,}"), "sk-[REDACTED]"),
-    (re.compile(r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*['\"]?[^'\"\s]+"), r"\1=[REDACTED]"),
+    (re.compile(r"(?i)(api[_-]?key|user[_-]?key|token|secret|password)\s*[:=]\s*['\"]?[^'\"\s]+"), r"\1=[REDACTED]"),
+    (re.compile(r"(?i)\b(user[_-]?key|api[_-]?key|token|secret|password)\s+[0-9a-f]{32,}\b"), r"\1 [REDACTED]"),
+    (re.compile(r"\b[0-9a-f]{40,}\b", re.I), "[REDACTED_HEX]"),
     (re.compile(r"(?i)authorization:\s*bearer\s+[A-Za-z0-9._-]+"), "authorization: bearer [REDACTED]"),
     (re.compile(r"AKIA[0-9A-Z]{16}"), "AKIA[REDACTED]"),
 ]
+
+NOISE_MARKERS = (
+    "Use /skills to list available skills",
+    "Working (",
+    "esc to interrupt",
+    "Press enter to confirm",
+    "Would you like to run the following command",
+    "Yes, and don't ask again",
+    "tokens used",
+    "Received ping",
+    "[TAILING] Tailing last",
+)
+
+KEY_SIGNAL_RE = re.compile(
+    r"(?i)\b(error|failed|failure|exception|panic|timeout|denied|blocked|"
+    r"commit|push|pull request|pr create|merge|test|typecheck|lint|build|"
+    r"deploy|restart|pm2|git status|diff|verified|verification|fixed|done)\b"
+)
 
 
 @dataclass
@@ -102,6 +127,11 @@ class JournalChunk:
     first_ts: str
     last_ts: str
     entry_count: int
+    total_entry_count: int
+    source_bytes: int
+    strategy: str
+    chunk_part: int
+    chunk_parts: int
     text: str
 
 
@@ -176,6 +206,147 @@ def _trim_entries(entries: list[str], max_chars: int) -> list[str]:
     return list(reversed(selected))
 
 
+def _noise_ratio(text: str) -> float:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return 0.0
+    noisy = 0
+    for line in lines:
+        if any(marker in line for marker in NOISE_MARKERS):
+            noisy += 1
+    return noisy / len(lines)
+
+
+def _clip_entry(entry: str, limit: int) -> str:
+    if len(entry) <= limit:
+        return entry
+    head = limit // 2
+    tail = max(0, limit - head - 80)
+    return (
+        entry[:head]
+        + f"\n... [ENTRY MIDDLE TRUNCATED {len(entry) - head - tail} chars] ...\n"
+        + entry[-tail:]
+    )
+
+
+def _select_planned_entries(entries: list[str], max_chars: int) -> tuple[list[str], str, list[int]]:
+    """Script-level planner: full small files, representative samples for large logs."""
+    full_text = "\n\n".join(entries)
+    if len(full_text) <= max_chars:
+        return entries, "full", list(range(len(entries)))
+
+    n = len(entries)
+    indices: set[int] = {0, max(0, n // 4), max(0, n // 2), max(0, (3 * n) // 4), n - 1}
+    signal_indices = [i for i, entry in enumerate(entries) if KEY_SIGNAL_RE.search(entry)]
+    if signal_indices:
+        step = max(1, len(signal_indices) // 8)
+        indices.update(signal_indices[::step][:8])
+        indices.update(signal_indices[-4:])
+
+    ordered = sorted(i for i in indices if 0 <= i < n)
+    if not ordered:
+        return _trim_entries(entries, max_chars), "tail-fallback", []
+
+    per_entry = max(600, max_chars // max(1, len(ordered)))
+    selected: list[str] = []
+    selected_indices: list[int] = []
+    total = 0
+    for idx in ordered:
+        item = _clip_entry(entries[idx], per_entry)
+        if selected and total + len(item) > max_chars:
+            continue
+        selected.append(item)
+        selected_indices.append(idx)
+        total += len(item)
+    if not selected:
+        selected = [_clip_entry(entries[-1], max_chars)]
+        selected_indices = [n - 1]
+    return selected, "planned-sample", selected_indices
+
+
+def _split_entry(entry: str) -> tuple[str, list[str]]:
+    lines = entry.splitlines()
+    if not lines:
+        return "(empty entry)", []
+    return lines[0], lines[1:]
+
+
+def _build_delta_full_records(entries: list[str]) -> list[tuple[int, str]]:
+    """Represent every entry in order while collapsing repeated pane snapshots.
+
+    tmux-journal captures whole pane snapshots, so adjacent entries are often
+    cumulative. A unified diff against the previous snapshot preserves full
+    coverage while avoiding re-sending the same screen hundreds of times.
+    """
+    records: list[tuple[int, str]] = []
+    prev_body: list[str] | None = None
+    for idx, entry in enumerate(entries):
+        header, body = _split_entry(entry)
+        if prev_body is None:
+            payload = "\n".join(body)
+            kind = "FULL_SNAPSHOT"
+        else:
+            diff = list(difflib.unified_diff(
+                prev_body,
+                body,
+                fromfile=f"entry_{idx - 1}",
+                tofile=f"entry_{idx}",
+                lineterm="",
+                n=2,
+            ))
+            payload = "\n".join(diff) if diff else "(no visible pane change)"
+            kind = "DELTA_FROM_PREVIOUS"
+        records.append((
+            idx,
+            (
+                f"--- ENTRY {idx} {kind} ---\n"
+                f"{header}\n"
+                f"{payload}"
+            ),
+        ))
+        prev_body = body
+    return records
+
+
+def _split_record_text(text: str, max_chars: int) -> list[str]:
+    if len(text) <= max_chars:
+        return [text]
+    parts: list[str] = []
+    start = 0
+    while start < len(text):
+        end = min(start + max_chars, len(text))
+        parts.append(text[start:end])
+        start = end
+    total = len(parts)
+    return [
+        f"--- RECORD_PART {i + 1}/{total} ---\n{part}"
+        for i, part in enumerate(parts)
+    ]
+
+
+def _pack_records(records: list[tuple[int, str]], max_chars: int) -> list[tuple[list[int], str]]:
+    chunks: list[tuple[list[int], str]] = []
+    cur_indices: list[int] = []
+    cur_parts: list[str] = []
+    cur_len = 0
+    record_budget = max(1000, max_chars - 500)
+    for idx, record in records:
+        for piece in _split_record_text(record, record_budget):
+            piece_len = len(piece) + 2
+            if cur_parts and cur_len + piece_len > max_chars:
+                chunks.append((cur_indices, "\n\n".join(cur_parts)))
+                cur_indices = []
+                cur_parts = []
+                cur_len = 0
+            cur_parts.append(piece)
+            if idx not in cur_indices:
+                cur_indices.append(idx)
+            cur_len += piece_len
+    if cur_parts:
+        chunks.append((cur_indices, "\n\n".join(cur_parts)))
+    return chunks
+
+
 def discover_chunks(
     *,
     journal_dir: str,
@@ -183,6 +354,7 @@ def discover_chunks(
     max_files: int,
     max_chunks: int,
     max_chars_per_chunk: int,
+    coverage_mode: str = "delta-full",
 ) -> list[JournalChunk]:
     root = Path(journal_dir).expanduser()
     cutoff = datetime.now() - timedelta(days=since_days) if since_days > 0 else None
@@ -205,32 +377,56 @@ def discover_chunks(
     candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
     chunks: list[JournalChunk] = []
     for _, _, path, entries in candidates[:max_files]:
-        selected = _trim_entries(entries, max_chars_per_chunk)
-        if not selected:
+        if coverage_mode == "sample":
+            selected, strategy, selected_indices = _select_planned_entries(entries, max_chars_per_chunk)
+            packed = [(selected_indices, "\n\n".join(selected))]
+        else:
+            strategy = "delta-full"
+            packed = _pack_records(_build_delta_full_records(entries), max_chars_per_chunk)
+        if not packed:
             continue
-        first_ts, last_ts, _ = _time_range(selected)
         pane_id = _pane_id_from_path(path)
         pane_name = _pane_name(path)
-        chunk_id = f"{pane_id.strip('%')}-{len(chunks):03d}"
-        header = (
-            f"chunk_id: {chunk_id}\n"
-            f"source: {path}\n"
-            f"pane_id: {pane_id}\n"
-            f"pane_name: {pane_name}\n"
-            f"time_range: {first_ts} -> {last_ts}\n"
-            f"entries_in_chunk: {len(selected)}\n\n"
-        )
-        body = _clip(_redact("\n\n".join(selected)), max_chars_per_chunk)
-        chunks.append(JournalChunk(
-            chunk_id=chunk_id,
-            source=str(path),
-            pane_id=pane_id,
-            pane_name=pane_name,
-            first_ts=first_ts,
-            last_ts=last_ts,
-            entry_count=len(selected),
-            text=header + body,
-        ))
+        source_bytes = path.stat().st_size
+        chunk_parts = len(packed)
+        for part_idx, (selected_indices, selected_text) in enumerate(packed, start=1):
+            selected_entries = [entries[i] for i in selected_indices if 0 <= i < len(entries)]
+            first_ts, last_ts, _ = _time_range(selected_entries)
+            noise = _noise_ratio(selected_text)
+            chunk_id = f"{pane_id.strip('%')}-{len(chunks):04d}"
+            header = (
+                f"chunk_id: {chunk_id}\n"
+                f"source: {path}\n"
+                f"pane_id: {pane_id}\n"
+                f"pane_name: {pane_name}\n"
+                f"time_range: {first_ts} -> {last_ts}\n"
+                f"source_bytes: {source_bytes}\n"
+                f"total_entries_in_file: {len(entries)}\n"
+                f"selected_entries_in_chunk: {len(set(selected_indices))}\n"
+                f"selected_entry_indices: {selected_indices[:30]}\n"
+                f"planner_strategy: {strategy}\n"
+                f"coverage_mode: {coverage_mode}\n"
+                f"file_chunk_part: {part_idx}/{chunk_parts}\n"
+                f"selected_noise_ratio: {noise:.2f}\n\n"
+            )
+            body = _redact(selected_text)
+            chunks.append(JournalChunk(
+                chunk_id=chunk_id,
+                source=str(path),
+                pane_id=pane_id,
+                pane_name=pane_name,
+                first_ts=first_ts,
+                last_ts=last_ts,
+                entry_count=len(set(selected_indices)),
+                total_entry_count=len(entries),
+                source_bytes=source_bytes,
+                strategy=strategy,
+                chunk_part=part_idx,
+                chunk_parts=chunk_parts,
+                text=header + body,
+            ))
+            if len(chunks) >= max_chunks:
+                break
         if len(chunks) >= max_chunks:
             break
     return chunks
@@ -312,6 +508,11 @@ def _worker_row(chunk: JournalChunk, outcome: JournalOutcome, *, model: str) -> 
         "first_ts": chunk.first_ts,
         "last_ts": chunk.last_ts,
         "entry_count": chunk.entry_count,
+        "total_entry_count": chunk.total_entry_count,
+        "source_bytes": chunk.source_bytes,
+        "strategy": chunk.strategy,
+        "chunk_part": chunk.chunk_part,
+        "chunk_parts": chunk.chunk_parts,
         "ok": outcome.parsed is not None,
         "parse_error": outcome.parse_error,
         **_call_fields(outcome.call),
@@ -371,6 +572,44 @@ def _load_rows(path: str) -> list[dict]:
     return rows
 
 
+def _latest_ok_worker_rows_from_rows(rows: list[dict]) -> dict[str, dict]:
+    rows_by_chunk: dict[str, dict] = {}
+    for row in rows:
+        if row.get("kind") != "journal_worker":
+            continue
+        if not row.get("ok") or not row.get("parsed") or not row.get("chunk_id"):
+            continue
+        rows_by_chunk[str(row["chunk_id"])] = row
+    return rows_by_chunk
+
+
+def _latest_ok_worker_rows(path: str) -> dict[str, dict]:
+    return _latest_ok_worker_rows_from_rows(_load_rows(path))
+
+
+def _load_manifest(out_dir: str) -> list[dict]:
+    path = os.path.join(out_dir, "chunks_manifest.json")
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _usage_by_role_model(rows: list[dict]) -> dict[tuple[str, str], int]:
+    usage: dict[tuple[str, str], int] = {}
+    for row in rows:
+        total = int(row.get("tokens_total") or 0)
+        if not total:
+            continue
+        key = (str(row.get("role") or "?"), str(row.get("model") or row.get("backend") or "?"))
+        usage[key] = usage.get(key, 0) + total
+    return usage
+
+
 def _aggregate_worker_patterns(worker_rows: list[dict]) -> list[dict]:
     buckets: dict[str, dict] = {}
     for row in worker_rows:
@@ -396,29 +635,61 @@ def _aggregate_worker_patterns(worker_rows: list[dict]) -> list[dict]:
 def write_digest(out_dir: str) -> str:
     os.makedirs(out_dir, exist_ok=True)
     rows = _load_rows(os.path.join(out_dir, "journal_results.jsonl"))
-    worker_rows = [r for r in rows if r.get("kind") == "journal_worker"]
+    manifest_rows = _load_manifest(out_dir)
+    historical_worker_rows = [r for r in rows if r.get("kind") == "journal_worker"]
+    latest_ok_by_chunk = _latest_ok_worker_rows_from_rows(rows)
+    worker_rows = list(latest_ok_by_chunk.values())
     coord_rows = [r for r in rows if r.get("kind") == "journal_coordinator"]
     coord = coord_rows[-1] if coord_rows else None
     parsed = (coord or {}).get("parsed") or {}
     top_patterns = parsed.get("top_patterns") or _aggregate_worker_patterns(worker_rows)
 
-    usage: dict[tuple[str, str], int] = {}
-    for row in rows:
-        total = int(row.get("tokens_total") or 0)
-        if not total:
-            continue
-        key = (str(row.get("role") or "?"), str(row.get("model") or row.get("backend") or "?"))
-        usage[key] = usage.get(key, 0) + total
+    usage_rows = worker_rows + ([coord] if coord else [])
+    usage = _usage_by_role_model(usage_rows)
+    expected_chunk_ids = {str(r["chunk_id"]) for r in manifest_rows if r.get("chunk_id")}
+    missing_chunk_ids = expected_chunk_ids - set(latest_ok_by_chunk)
+    historical_error_count = sum(1 for r in historical_worker_rows if not r.get("ok"))
 
     out: list[str] = []
     out.append(f"# Tmux Journal Swarm Digest — {os.path.basename(out_dir)}\n")
     out.append(f"- chunks analyzed: **{len(worker_rows)}**")
-    out.append(f"- worker errors: **{sum(1 for r in worker_rows if not r.get('ok'))}**")
+    if worker_rows:
+        source_meta: dict[str, dict] = {}
+        for row in worker_rows:
+            source = row.get("source")
+            if source and source not in source_meta:
+                source_meta[str(source)] = row
+        total_source_bytes = sum(int(r.get("source_bytes") or 0) for r in source_meta.values())
+        total_source_entries = sum(int(r.get("total_entry_count") or r.get("entry_count") or 0) for r in source_meta.values())
+        selected_entries = sum(int(r.get("entry_count") or 0) for r in worker_rows)
+        strategies: dict[str, int] = {}
+        for row in worker_rows:
+            strategy = str(row.get("strategy") or "unknown")
+            strategies[strategy] = strategies.get(strategy, 0) + 1
+        out.append(f"- source files covered: **{len(source_meta)}**")
+        out.append(f"- source volume covered: **{total_source_bytes / 1024 / 1024:.2f} MB**, **{total_source_entries}** total entries")
+        out.append(f"- entry references sent to workers: **{selected_entries}**")
+        source_file_count = len(source_meta) or 1
+        out.append("- planner strategies: " + ", ".join(f"`{k}`={v}" for k, v in sorted(strategies.items())))
+        out.append(f"- avg chunks per source file: **{len(worker_rows) / source_file_count:.2f}**")
+    out.append(f"- current missing/failed worker chunks: **{len(missing_chunk_ids)}**")
+    if historical_error_count:
+        out.append(f"- historical worker error attempts during retries: **{historical_error_count}**")
     out.append(f"- coordinator ok: **{bool(coord and coord.get('ok'))}**")
     if usage:
-        out.append("- swarm token usage:")
+        out.append("- effective swarm token usage (latest successful workers + final coordinator):")
         for (role, model), total in sorted(usage.items()):
             out.append(f"  - `{role}` `{model}`: {total:,} total tokens")
+        worker_token_rows = [r for r in worker_rows if int(r.get("tokens_total") or 0) > 0]
+        if worker_token_rows:
+            largest = max(worker_token_rows, key=lambda r: int(r.get("tokens_total") or 0))
+            largest_total = int(largest.get("tokens_total") or 0)
+            worker_total = sum(int(r.get("tokens_total") or 0) for r in worker_token_rows)
+            if largest_total > 5_000_000 and largest_total > worker_total * 0.5:
+                out.append(
+                    f"- token usage caveat: chunk `{largest.get('chunk_id')}` reports "
+                    f"{largest_total:,} worker tokens and dominates the total; treat usage accounting as noisy."
+                )
     if parsed.get("run_quality"):
         rq = parsed["run_quality"]
         out.append(f"- coverage: {rq.get('coverage', '')}")
@@ -485,6 +756,7 @@ async def run(args: argparse.Namespace) -> int:
         max_files=args.max_files,
         max_chunks=args.max_chunks,
         max_chars_per_chunk=args.max_chars_per_chunk,
+        coverage_mode=args.coverage_mode,
     )
     manifest_path = os.path.join(out_dir, "chunks_manifest.json")
     with open(manifest_path, "w", encoding="utf-8") as f:
@@ -496,16 +768,26 @@ async def run(args: argparse.Namespace) -> int:
             "first_ts": c.first_ts,
             "last_ts": c.last_ts,
             "entry_count": c.entry_count,
+            "total_entry_count": c.total_entry_count,
+            "source_bytes": c.source_bytes,
+            "strategy": c.strategy,
+            "chunk_part": c.chunk_part,
+            "chunk_parts": c.chunk_parts,
         } for c in chunks], f, ensure_ascii=False, indent=2)
+
+    worker_rows_by_chunk = _latest_ok_worker_rows(result_path)
+    chunks_to_process = [c for c in chunks if c.chunk_id not in worker_rows_by_chunk]
 
     print(
         f"[tmux-journal] runtime={runtime} worker={worker_model} "
-        f"coordinator={coordinator_model} chunks={len(chunks)} output={out_dir}"
+        f"coordinator={coordinator_model} chunks={len(chunks)} "
+        f"to_process={len(chunks_to_process)} already_done={len(worker_rows_by_chunk)} "
+        f"output={out_dir}"
     )
 
     queue: asyncio.Queue[JournalChunk | None] = asyncio.Queue()
     sem = asyncio.Semaphore(args.concurrency)
-    worker_rows: list[dict] = []
+    worker_rows: list[dict] = list(worker_rows_by_chunk.values())
 
     async def worker(idx: int) -> None:
         while True:
@@ -521,19 +803,21 @@ async def run(args: argparse.Namespace) -> int:
                     max_tokens=args.worker_max_tokens,
                 )
             row = _worker_row(chunk, outcome, model=worker_model)
-            worker_rows.append(row)
             _write_jsonl(result_path, row)
+            if row.get("ok") and row.get("parsed"):
+                worker_rows_by_chunk[row["chunk_id"]] = row
             if outcome.parse_error:
                 print(f"[tmux-journal] worker {idx} error {chunk.chunk_id}: {outcome.parse_error[:160]}")
             queue.task_done()
 
     workers = [asyncio.create_task(worker(i)) for i in range(args.concurrency)]
-    for chunk in chunks:
+    for chunk in chunks_to_process:
         await queue.put(chunk)
     for _ in workers:
         await queue.put(None)
     await queue.join()
     await asyncio.gather(*workers)
+    worker_rows = list(worker_rows_by_chunk.values())
 
     coord = await run_coordinator(
         backend=coordinator_backend,
@@ -571,6 +855,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-files", type=int, default=24)
     p.add_argument("--max-chunks", type=int, default=12)
     p.add_argument("--max-chars-per-chunk", type=int, default=12000)
+    p.add_argument("--coverage-mode", choices=["delta-full", "sample"], default="delta-full")
     p.add_argument("--worker-max-tokens", type=int, default=900)
     p.add_argument("--coordinator-max-tokens", type=int, default=3000)
     p.add_argument("--output-dir", default="runs")
