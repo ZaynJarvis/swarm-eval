@@ -309,18 +309,21 @@ def summarize(out_dir: str) -> str:
         if r["parsed"].get("hook_sufficiency") == "sufficient"
         or r["parsed"].get("gold_supported_in_hook") is True
     ]
+    strict_sufficient = sum(
+        1 for r in rows if r["parsed"].get("hook_sufficiency") == "sufficient"
+    )
 
     out: list[str] = []
     out.append(f"# Hook Recall Quality Digest — {os.path.basename(out_dir)}\n")
     out.append(f"- WRONG sessions analyzed: **{len(rows)}**")
     out.append(f"- worker errors: **{len(errors)}**")
     out.append(
-        f"- hook already supported gold: **{gold_supported}** "
+        f"- hook contained enough gold evidence: **{gold_supported}** "
         f"({(gold_supported / len(rows) * 100) if rows else 0:.1f}%)"
     )
     out.append(
-        f"- sufficient hook / answer still wrong: **{len(sufficient_rows)}** "
-        f"({(len(sufficient_rows) / len(rows) * 100) if rows else 0:.1f}%)"
+        f"- strict `sufficient` hook bucket: **{strict_sufficient}** "
+        f"({(strict_sufficient / len(rows) * 100) if rows else 0:.1f}%)"
     )
     out.append(
         f"- wrong response also supported by hook distractor/noise: **{response_supported}** "
