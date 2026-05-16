@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+
+# Local eval artifacts can contain large logs, SQLite DBs, and private run data.
+runs/
+data/
+
+# Local env/config.
+.env
+.venv/
+venv/
