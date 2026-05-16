@@ -11,7 +11,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
-from backends.codex import format_agent_prompt  # noqa: E402
+from backends.codex import format_agent_prompt, parse_codex_usage  # noqa: E402
 from backends.factory import build_backend, default_model_for_runtime, normalize_runtime  # noqa: E402
 from backends.opencode import parse_opencode_output  # noqa: E402
 from cli import _resolve_run_output_dir, _resolve_runtime_args  # noqa: E402
@@ -22,7 +22,7 @@ class RuntimeFactoryTests(unittest.TestCase):
         self.assertEqual(normalize_runtime("cli"), "claude-code")
         self.assertEqual(normalize_runtime("claude"), "claude-code")
         self.assertEqual(default_model_for_runtime("claude-code", "worker"), "claude-haiku-4-5-20251001")
-        self.assertEqual(default_model_for_runtime("codex", "worker"), "gpt-5.3-codex-spark")
+        self.assertEqual(default_model_for_runtime("codex", "worker"), "gpt-5.5")
         self.assertEqual(default_model_for_runtime("codex", "coordinator"), "gpt-5.5")
 
     def test_runtime_args_allow_split_worker_and_coordinator(self) -> None:
@@ -37,7 +37,7 @@ class RuntimeFactoryTests(unittest.TestCase):
         worker_runtime, coordinator_runtime, worker_model, coordinator_model = _resolve_runtime_args(args)
         self.assertEqual(worker_runtime, "codex")
         self.assertEqual(coordinator_runtime, "claude-code")
-        self.assertEqual(worker_model, "gpt-5.3-codex-spark")
+        self.assertEqual(worker_model, "gpt-5.5")
         self.assertEqual(coordinator_model, "claude-opus-4-7")
 
     def test_legacy_backend_conflicts_with_runtime_flags(self) -> None:
@@ -87,6 +87,10 @@ class RuntimeParserTests(unittest.TestCase):
         self.assertIn("SYSTEM RULE", prompt)
         self.assertIn("USER PAYLOAD", prompt)
         self.assertIn("700 output tokens", prompt)
+
+    def test_codex_usage_parser_handles_total_only_stderr(self) -> None:
+        stderr = "OpenAI Codex v0.130.0\nmodel: gpt-5.5\n\ntokens used\n11,756\n"
+        self.assertEqual(parse_codex_usage(stderr)["total_tokens"], 11756)
 
     def test_opencode_parser_handles_acp_chunks(self) -> None:
         blob = "\n".join([

@@ -12,8 +12,10 @@ classifications**, **expensive-but-correct diagnostics**, plus a growing
   classify-and-output-JSON. Concurrency capped by `asyncio.Semaphore`.
 - **Runtimes** — worker and coordinator calls go through a swappable runtime
   interface. Claude Code, Codex, and OpenCode can be selected independently for
-  workers/coordinator. The current Codex defaults are `gpt-5.3-codex-spark`
-  workers and `gpt-5.5` coordinator.
+  workers/coordinator. The current Codex defaults are `gpt-5.5` workers and
+  `gpt-5.5` coordinator with low reasoning effort; override with
+  `--worker-model`, `--coordinator-model`, `SWARM_CODEX_WORKER_REASONING`, or
+  `SWARM_CODEX_COORDINATOR_REASONING`.
 - **Pattern library grows** as the run progresses. Workers see the latest
   library in their system prompt at call-time. Library is persisted, so a
   re-run of a similar dataset starts warm.
@@ -78,7 +80,7 @@ python3 src/cli.py run \
   --result-dir /path/to/result-dir \
   --worker-runtime codex \
   --coordinator-runtime codex \
-  --worker-model gpt-5.3-codex-spark \
+  --worker-model gpt-5.5 \
   --coordinator-model gpt-5.5 \
   --scope wrong-plus-correct-calibration \
   --output-dir runs \
@@ -93,6 +95,15 @@ python3 src/hook_recall_analysis.py \
   --runtime codex \
   --concurrency 4 \
   --run-id hook-recall-wrong-only
+
+# 5) third-pass tmux journal workflow-pattern swarm
+python3 src/tmux_journal_analysis.py \
+  --journal-dir ~/.tmux-journal \
+  --runtime codex \
+  --worker-model gpt-5.5 \
+  --coordinator-model gpt-5.5 \
+  --concurrency 2 \
+  --run-id tmux-journal-gpt55-low
 ```
 
 The orchestrator is **resume-safe**: re-running with the same `--run-id` skips
@@ -122,6 +133,11 @@ contained enough information to answer the gold answer, and separates:
 - `partial` / `absent` — hook recall missed required information
 - `misleading` — hook recall surfaced distractors or wrong-window evidence
 - `unassessable` — hook context is too truncated/ambiguous to judge
+
+`runs/<run-id>/tmux_journal_digest.md` is a separate third-pass report for
+tmux-journal logs. Workers analyze redacted pane chunks, then the coordinator
+merges recurring workflow, tooling, verification, automation, and memory-quality
+patterns into user-facing insight.
 
 ## Plugging a new eval dataset
 
@@ -215,7 +231,9 @@ This replaces the older retry-with-versioning approach. Cleaner, bounded, single
   cost-controlled runs.
 - `pattern_store.db` is persistent; deleting the file resets the library.
 - Cost shows up in token counts (per-call) in `results.jsonl` and aggregated in
-  the digest.
+  the digest. For Codex CLI calls, the wrapper records the total token count
+  printed by `codex exec` stderr; granular input/cache/output fields remain
+  zero unless the runtime exposes them.
 - Circuit breaker aborts the run if workers or reflections hit repeated backend
   failures, then skips final reflection/sweep so a bad backend does not produce
   a clean-looking digest.

@@ -22,7 +22,7 @@ _ALIASES = {
 
 _CLAUDE_WORKER_MODEL = "claude-haiku-4-5-20251001"
 _CLAUDE_COORDINATOR_MODEL = "claude-opus-4-7"
-_CODEX_WORKER_MODEL = "gpt-5.3-codex-spark"
+_CODEX_WORKER_MODEL = "gpt-5.5"
 _CODEX_COORDINATOR_MODEL = "gpt-5.5"
 
 

@@ -183,6 +183,8 @@ def summarize(run_dir: str) -> str:
 
     # ---- token / cost from log
     tot_in = tot_out = tot_cache = 0
+    tot_total = 0
+    usage_by_role_model: dict[tuple[str, str], int] = {}
     worker_runs = reflections = 0
     parse_errors = 0
     pv_max = 0
@@ -203,6 +205,14 @@ def summarize(run_dir: str) -> str:
                 tot_in += int(o.get("tokens_in", 0) or 0)
                 tot_cache += int(o.get("tokens_cache", 0) or 0)
                 tot_out += int(o.get("tokens_out", 0) or 0)
+                total = int(o.get("tokens_total", 0) or 0)
+                tot_total += total
+                if total:
+                    key = (
+                        str(o.get("role") or ("coordinator" if "reflection" in o.get("kind", "") else "worker")),
+                        str(o.get("model") or o.get("backend") or "unknown"),
+                    )
+                    usage_by_role_model[key] = usage_by_role_model.get(key, 0) + total
     out.append(
         f"- worker calls: {worker_runs} (parse errors: {parse_errors}); reflections: {reflections}; max pattern_version: {pv_max}"
     )
@@ -210,6 +220,13 @@ def summarize(run_dir: str) -> str:
         f"- tokens (input / cache_read / output): "
         f"{tot_in:,} / {tot_cache:,} / {tot_out:,}"
     )
+    if tot_total:
+        out.append(f"- tokens (Codex total where available): {tot_total:,}")
+        out.append("\n### Runtime token usage by role/model\n")
+        out.append("| role | model | total_tokens |")
+        out.append("|---|---|---:|")
+        for (role, model), total in sorted(usage_by_role_model.items()):
+            out.append(f"| `{role}` | `{model}` | {total:,} |")
 
     # ---- post-hoc signature normalization (typo alias map)
     alias, alias_edges = _compute_signature_aliases(db)

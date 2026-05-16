@@ -246,10 +246,12 @@ def _write_jsonl(path: str, obj: dict) -> None:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 
-def _row_from_outcome(linked: LinkedSession, outcome: HookOutcome) -> dict:
+def _row_from_outcome(linked: LinkedSession, outcome: HookOutcome, *, model: str) -> dict:
     return {
         "kind": "hook_recall_worker",
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "role": "worker",
+        "model": model,
         "session_id": linked.session_id,
         "sample_id": linked.sample_id,
         "qix": linked.question_index,
@@ -266,6 +268,8 @@ def _row_from_outcome(linked: LinkedSession, outcome: HookOutcome) -> dict:
         "tokens_in": outcome.call.input_tokens,
         "tokens_cache": outcome.call.cache_read_tokens,
         "tokens_out": outcome.call.output_tokens,
+        "tokens_total": outcome.call.total_tokens,
+        "reasoning_effort": outcome.call.reasoning_effort,
         "raw_head": (outcome.raw_text or "")[:500],
         "parsed": outcome.parsed,
     }
@@ -304,6 +308,10 @@ def summarize(out_dir: str) -> str:
     owner_counts = count_by("failure_owner")
     gold_supported = sum(1 for r in rows if r["parsed"].get("gold_supported_in_hook"))
     response_supported = sum(1 for r in rows if r["parsed"].get("response_supported_in_hook"))
+    usage_by_model: dict[tuple[str, str], int] = {}
+    for r in rows:
+        key = (str(r.get("role") or "worker"), str(r.get("model") or r.get("backend") or "unknown"))
+        usage_by_model[key] = usage_by_model.get(key, 0) + int(r.get("tokens_total") or 0)
     sufficient_rows = [
         r for r in rows
         if r["parsed"].get("hook_sufficiency") == "sufficient"
@@ -329,6 +337,10 @@ def summarize(out_dir: str) -> str:
         f"- wrong response also supported by hook distractor/noise: **{response_supported}** "
         f"({(response_supported / len(rows) * 100) if rows else 0:.1f}%)"
     )
+    if any(usage_by_model.values()):
+        out.append("- analyzer token usage:")
+        for (role, model), total in sorted(usage_by_model.items()):
+            out.append(f"  - `{role}` `{model}`: {total:,} total tokens")
 
     out.append("\n## Hook Sufficiency\n")
     out.append("| bucket | count | pct |")
@@ -420,7 +432,7 @@ async def run(args: argparse.Namespace) -> int:
                     max_hook_chars=args.max_hook_chars,
                     max_tokens=args.max_tokens,
                 )
-            _write_jsonl(result_path, _row_from_outcome(linked, outcome))
+            _write_jsonl(result_path, _row_from_outcome(linked, outcome, model=model))
             queue.task_done()
             if outcome.parse_error:
                 print(f"[hook-recall] worker {idx} error {linked.session_id[:8]}: {outcome.parse_error[:160]}")

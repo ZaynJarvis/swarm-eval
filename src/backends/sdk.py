@@ -48,10 +48,14 @@ class SdkBackend(Backend):
             return CallResult(text="", backend=self.name, error=f"{type(e).__name__}: {e}")
         text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
         usage = resp.usage
+        input_tokens = getattr(usage, "input_tokens", 0) or 0
+        cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
+        output_tokens = getattr(usage, "output_tokens", 0) or 0
         return CallResult(
             text=text,
-            input_tokens=getattr(usage, "input_tokens", 0),
-            cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
-            output_tokens=getattr(usage, "output_tokens", 0),
+            input_tokens=input_tokens,
+            cache_read_tokens=cache_read_tokens,
+            output_tokens=output_tokens,
+            total_tokens=input_tokens + cache_read_tokens + output_tokens,
             backend=self.name,
         )

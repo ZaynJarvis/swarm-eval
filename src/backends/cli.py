@@ -137,10 +137,14 @@ def _parse_json_output(blob: str, *, backend_name: str) -> CallResult:
     elif isinstance(obj.get("text"), str):
         text = obj["text"]
     usage = obj.get("usage") or {}
+    input_tokens = usage.get("input_tokens", 0) or 0
+    cache_read_tokens = usage.get("cache_read_input_tokens", 0) or 0
+    output_tokens = usage.get("output_tokens", 0) or 0
     return CallResult(
         text=text,
-        input_tokens=usage.get("input_tokens", 0) or 0,
-        cache_read_tokens=usage.get("cache_read_input_tokens", 0) or 0,
-        output_tokens=usage.get("output_tokens", 0) or 0,
+        input_tokens=input_tokens,
+        cache_read_tokens=cache_read_tokens,
+        output_tokens=output_tokens,
+        total_tokens=input_tokens + cache_read_tokens + output_tokens,
         backend=backend_name,
     )

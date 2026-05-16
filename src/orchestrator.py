@@ -118,6 +118,17 @@ def write_jsonl(path: str, obj: dict) -> None:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 
+def _call_usage_fields(call) -> dict:
+    return {
+        "tokens_in": call.input_tokens,
+        "tokens_cache": call.cache_read_tokens,
+        "tokens_out": call.output_tokens,
+        "tokens_total": call.total_tokens,
+        "reasoning_effort": call.reasoning_effort,
+        "backend": call.backend,
+    }
+
+
 def _read_run_summary(result_dir: str) -> str:
     parts = []
     for fn in ("summary.txt", "experiment_report.md"):
@@ -336,12 +347,11 @@ def _persist_worker_outcome(*, state: _RunState, name: str, linked: LinkedSessio
         "verdict_truth": linked.result,
         "attempt": attempt,
         "pattern_version": state.pattern_version,
+        "role": "worker",
+        "model": state.cfg.worker_model,
         "ok": outcome.parsed is not None,
         "parse_error": outcome.parse_error,
-        "tokens_in": outcome.call.input_tokens,
-        "tokens_cache": outcome.call.cache_read_tokens,
-        "tokens_out": outcome.call.output_tokens,
-        "backend": outcome.call.backend,
+        **_call_usage_fields(outcome.call),
         "raw_head": (outcome.raw_text or "")[:500],
         "parsed": outcome.parsed,
     }
@@ -447,9 +457,9 @@ async def _reflection_task(*, state: _RunState, run_context: str,
             "applied_ops": outcome.applied_ops,
             "resolved_escs": outcome.resolved_escs,
             "writebacks": outcome.writebacks,
-            "tokens_in": outcome.call.input_tokens,
-            "tokens_cache": outcome.call.cache_read_tokens,
-            "tokens_out": outcome.call.output_tokens,
+            "role": "coordinator",
+            "model": cfg.coordinator_model,
+            **_call_usage_fields(outcome.call),
             "raw_head": (outcome.raw_text or "")[:500],
         })
         _record_backend_result(
@@ -546,12 +556,11 @@ async def _final_sweep(*, state: _RunState, all_sessions: list[LinkedSession],
                 "session_total_tokens": _total_session_tokens(linked),
                 "verdict_truth": linked.result,
                 "pattern_version": state.pattern_version,
+                "role": "worker",
+                "model": cfg.worker_model,
                 "ok": outcome.parsed is not None,
                 "parse_error": outcome.parse_error,
-                "tokens_in": outcome.call.input_tokens,
-                "tokens_cache": outcome.call.cache_read_tokens,
-                "tokens_out": outcome.call.output_tokens,
-                "backend": outcome.call.backend,
+                **_call_usage_fields(outcome.call),
                 "raw_head": (outcome.raw_text or "")[:500],
                 "parsed": outcome.parsed,
             }
@@ -765,9 +774,9 @@ async def run(cfg: RunConfig) -> None:
             "applied_ops": outcome.applied_ops,
             "resolved_escs": outcome.resolved_escs,
             "writebacks": outcome.writebacks,
-            "tokens_in": outcome.call.input_tokens,
-            "tokens_cache": outcome.call.cache_read_tokens,
-            "tokens_out": outcome.call.output_tokens,
+            "role": "coordinator",
+            "model": cfg.coordinator_model,
+            **_call_usage_fields(outcome.call),
             "raw_head": (outcome.raw_text or "")[:500],
         })
         _record_backend_result(
