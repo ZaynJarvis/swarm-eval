@@ -273,15 +273,22 @@ def _row_from_outcome(linked: LinkedSession, outcome: HookOutcome) -> dict:
 
 def summarize(out_dir: str) -> str:
     path = os.path.join(out_dir, "hook_recall_results.jsonl")
-    rows: list[dict] = []
-    errors: list[dict] = []
+    rows_by_session: dict[str, dict] = {}
+    errors_by_session: dict[str, dict] = {}
     with open(path, encoding="utf-8") as f:
         for line in f:
             obj = json.loads(line)
+            sid = obj.get("session_id")
+            if not sid:
+                continue
             if obj.get("ok") and obj.get("parsed"):
-                rows.append(obj)
+                rows_by_session[sid] = obj
+                errors_by_session.pop(sid, None)
             else:
-                errors.append(obj)
+                if sid not in rows_by_session:
+                    errors_by_session[sid] = obj
+    rows = list(rows_by_session.values())
+    errors = list(errors_by_session.values())
 
     def parsed_value(row: dict, key: str) -> str:
         return str(row["parsed"].get(key) or "unknown")
