@@ -30,7 +30,13 @@ def resolve_codex_command() -> str:
 def _clip(s: str, limit: int) -> str:
     if len(s) <= limit:
         return s
-    return s[:limit] + f"... [truncated {len(s) - limit} chars]"
+    head = max(0, limit // 2)
+    tail = max(0, limit - head)
+    return (
+        s[:head]
+        + f"... [truncated middle {len(s) - head - tail} chars] ..."
+        + s[-tail:]
+    )
 
 
 def _parse_int(s: str) -> int:
@@ -99,7 +105,7 @@ class CodexBackend(Backend):
         cwd: str | None = None,
     ) -> None:
         self.command = command or resolve_codex_command()
-        self.timeout_s = timeout_s
+        self.timeout_s = float(os.environ.get("SWARM_CODEX_TIMEOUT_S", timeout_s))
         self.error_log_chars = error_log_chars
         self.cwd = cwd or os.getcwd()
 

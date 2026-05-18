@@ -104,6 +104,16 @@ python3 src/tmux_journal_analysis.py \
   --coordinator-model gpt-5.5 \
   --concurrency 2 \
   --run-id tmux-journal-gpt55-low
+
+# 6) SWE-ContextBench context-value taxonomy swarm
+python3 src/swe_contextbench_analysis.py \
+  --dataset-dir /Users/bytedance/code/c/SWEContextBench \
+  --runtime codex \
+  --worker-model gpt-5.3-codex-spark \
+  --coordinator-model gpt-5.5 \
+  --max-chars-per-chunk 250000 \
+  --concurrency 3 \
+  --run-id swectx-full-gpt55-spark
 ```
 
 The orchestrator is **resume-safe**: re-running with the same `--run-id` skips
@@ -138,6 +148,12 @@ contained enough information to answer the gold answer, and separates:
 tmux-journal logs. Workers analyze redacted pane chunks, then the coordinator
 merges recurring workflow, tooling, verification, automation, and memory-quality
 patterns into user-facing insight.
+
+`runs/<run-id>/swe_contextbench_digest.md` is a separate report for
+SWE-ContextBench. A coordinator first samples related/experience task pairs and
+creates seed tags, workers then read full related-task plus linked
+experience-task text, and the final coordinator merges worker tags into a
+context-value taxonomy with case IDs and token usage by role/model.
 
 ## Plugging a new eval dataset
 
@@ -234,6 +250,8 @@ This replaces the older retry-with-versioning approach. Cleaner, bounded, single
   the digest. For Codex CLI calls, the wrapper records the total token count
   printed by `codex exec` stderr; granular input/cache/output fields remain
   zero unless the runtime exposes them.
+- `SWARM_CODEX_TIMEOUT_S` can raise the Codex subprocess timeout for very large
+  SWE-ContextBench chunks that need more than the default 300 seconds.
 - Circuit breaker aborts the run if workers or reflections hit repeated backend
   failures, then skips final reflection/sweep so a bad backend does not produce
   a clean-looking digest.
