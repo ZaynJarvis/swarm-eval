@@ -1,3 +1,5 @@
+![swarm-eval cover](assets/swarm-eval-cover.png)
+
 # swarm-eval
 
 Agent-swarm pipeline that analyzes eval session files (locomo10 first; designed
